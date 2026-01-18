@@ -10,7 +10,7 @@ param labUserObjectId string
 @description('The name prefix for all resources')
 param resourcePrefix string = 'lab565'
 
-@description('The location where all resources will be deployed')
+@description('The location where all resources will be deployed (fallback only)')
 param location string = 'eastus'
 
 @description('Storage account SKU')
@@ -54,6 +54,11 @@ param mcpImageTag string = 'v1'
 @description('API key students will paste into Copilot Studio')
 param mcpApiKey string
 
+// ===============================================
+// LOCATION: use the RG location (more idiotproof)
+// ===============================================
+var rgLocation = resourceGroup().location
+
 // Variables for resource naming and configuration
 var uniqueSuffix = uniqueString(resourceGroup().id)
 var resourceNames = {
@@ -74,7 +79,7 @@ var storageAccountName = length(resourceNames.storageAccount) > 24 ? substring(r
 @description('Azure Storage Account for document storage and processing')
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
-  location: location
+  location: rgLocation
   sku: {
     name: storageAccountSku
   }
@@ -139,7 +144,7 @@ resource resumesContainer 'Microsoft.Storage/storageAccounts/blobServices/contai
 @description('Azure AI Search service for vector search and document indexing')
 resource searchService 'Microsoft.Search/searchServices@2023-11-01' = {
   name: resourceNames.searchService
-  location: location
+  location: rgLocation
   sku: {
     name: searchServiceSku
   }
@@ -174,7 +179,7 @@ resource searchService 'Microsoft.Search/searchServices@2023-11-01' = {
 @description('Azure OpenAI service for AI models and embeddings')
 resource openAiService 'Microsoft.CognitiveServices/accounts@2023-10-01-preview' = {
   name: resourceNames.openAiService
-  location: location
+  location: rgLocation
   sku: {
     name: openAiSku
   }
@@ -366,14 +371,18 @@ var mcpImage = '${acr.properties.loginServer}/hr-mcp-server:${mcpImageTag}'
 // Container Apps environment (per lab instance RG)
 resource mcpEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: mcpEnvName
-  location: location
-  properties: {}
+  location: rgLocation
+  properties: {
+    appLogsConfiguration: {
+      destination: 'none'
+    }
+  }
 }
 
 // Container App (public HTTPS, always on)
 resource mcpApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: mcpAppName
-  location: location
+  location: rgLocation
   properties: {
     managedEnvironmentId: mcpEnv.id
     configuration: {
@@ -460,7 +469,7 @@ output openAiServiceEndpoint string = openAiService.properties.endpoint
 output embeddingDeploymentName string = embeddingModelDeployment.name
 
 @description('Resource group location')
-output resourceGroupLocation string = location
+output resourceGroupLocation string = rgLocation
 
 @description('Unique suffix used for resource naming')
 output uniqueSuffix string = uniqueSuffix
