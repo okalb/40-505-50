@@ -1,6 +1,7 @@
 // ===============================================
 // Bicep template for LAB565 - Microsoft 365 Copilot Agents
 // Creates: Storage Account, AI Search, Search Index, OpenAI Service, Text Embedding Model
+// PLUS: Hosted MCP Server (Azure Container Apps) - no devtunnel needed
 // ===============================================
 
 @description('Lab user object ID for role assignments')
@@ -35,6 +36,23 @@ param embeddingModelVersion string = '2'
 @minValue(1)
 @maxValue(120)
 param embeddingModelCapacity int = 30
+
+// ===============================================
+// NEW PARAMS: Hosted MCP Server (Container Apps)
+// ===============================================
+
+@description('Shared resource group that hosts the ACR (registry)')
+param acrResourceGroup string
+
+@description('Shared ACR name (lowercase, globally unique)')
+param acrName string
+
+@description('MCP image tag in ACR (example: v1)')
+param mcpImageTag string = 'v1'
+
+@secure()
+@description('API key students will paste into Copilot Studio')
+param mcpApiKey string
 
 // Variables for resource naming and configuration
 var uniqueSuffix = uniqueString(resourceGroup().id)
@@ -327,6 +345,93 @@ resource CogsUserRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04
 }
 
 // ===============================================
+// NEW: HOSTED MCP SERVER (AZURE CONTAINER APPS)
+// ===============================================
+
+// Name safety: keep under typical 32-char constraints
+var mcpEnvBase = toLower('${resourcePrefix}-mcp-env-${uniqueSuffix}')
+var mcpEnvName = length(mcpEnvBase) > 32 ? substring(mcpEnvBase, 0, 32) : mcpEnvBase
+
+var mcpAppBase = toLower('${resourcePrefix}-mcp-${uniqueSuffix}')
+var mcpAppName = length(mcpAppBase) > 32 ? substring(mcpAppBase, 0, 32) : mcpAppBase
+
+resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
+  name: acrName
+  scope: resourceGroup(acrResourceGroup)
+}
+
+var acrCreds = listCredentials(acr.id, acr.apiVersion)
+var mcpImage = '${acr.properties.loginServer}/hr-mcp-server:${mcpImageTag}'
+
+// Container Apps environment (per lab instance RG)
+resource mcpEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
+  name: mcpEnvName
+  location: location
+  properties: {}
+}
+
+// Container App (public HTTPS, always on)
+resource mcpApp 'Microsoft.App/containerApps@2024-03-01' = {
+  name: mcpAppName
+  location: location
+  properties: {
+    managedEnvironmentId: mcpEnv.id
+    configuration: {
+      activeRevisionsMode: 'Single'
+      ingress: {
+        external: true
+        targetPort: 8080
+        transport: 'auto'
+        allowInsecure: false
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          username: acrCreds.username
+          passwordSecretRef: 'acr-password'
+        }
+      ]
+      secrets: [
+        {
+          name: 'acr-password'
+          value: acrCreds.passwords[0].value
+        }
+        {
+          name: 'mcp-api-key'
+          value: mcpApiKey
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'hrmcp'
+          image: mcpImage
+          env: [
+            // Standard container port
+            { name: 'ASPNETCORE_URLS', value: 'http://0.0.0.0:8080' }
+
+            // Ensure candidates file path works in Linux container
+            { name: 'HRMCPServer__CandidatesPath', value: 'Data/candidates.json' }
+
+            // Your app should enforce this header if MCP_API_KEY is set
+            { name: 'MCP_API_KEY', secretRef: 'mcp-api-key' }
+          ]
+          resources: {
+            cpu: 0.25
+            memory: '0.5Gi'
+          }
+        }
+      ]
+      scale: {
+        minReplicas: 1
+        maxReplicas: 1
+      }
+    }
+  }
+}
+
+// ===============================================
 // OUTPUTS
 // ===============================================
 
@@ -363,19 +468,9 @@ output uniqueSuffix string = uniqueSuffix
 @description('Lab user object ID')
 output labUserObjectId string = labUserObjectId
 
-// ===============================================
-// USAGE NOTES
-// ===============================================
-/*
+// NEW outputs for students
+@description('Hosted MCP base URL (students paste into Copilot Studio)')
+output mcpBaseUrl string = 'https://${mcpApp.properties.configuration.ingress.fqdn}'
 
-DEPLOYMENT COMMAND:
-# Deploy to an existing resource group
-az deployment group create --resource-group <your-existing-rg-name> --template-file LAB565.bicep --parameters resourcePrefix=<your-prefix>
-
-# Example with specific values:
-az deployment group create --resource-group rg-copilot-lab --template-file LAB565.bicep --parameters resourcePrefix=mylab565
-
-# To deploy with custom parameters:
-az deployment group create --resource-group <your-existing-rg-name> --template-file LAB565.bicep --parameters resourcePrefix=<your-prefix> storageAccountSku=Standard_GRS searchServiceSku=standard embeddingModelName=text-embedding-3-small
-
-*/
+@description('Header name to use for the MCP API key')
+output mcpHeaderName string = 'x-mcp-api-key'
