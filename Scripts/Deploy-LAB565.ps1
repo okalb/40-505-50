@@ -5,9 +5,10 @@ Deploy-LAB565.ps1 (student-run)
 - Ensure ACR exists (in same RG)
 - Download Dockerfile/.dockerignore into C:\labs\hr-mcp-server
 - ACR cloud build (no Docker required)
+- Download + validate Bicep
 - Deploy Bicep
 - Print MCP URL + header + API key
-- Quick smoke test
+- Quick smoke test (expects 401/403 without key, then tries with key)
 #>
 
 [CmdletBinding()]
@@ -37,19 +38,20 @@ function Require-AzCli {
 }
 
 function Ensure-LoggedIn {
-  try { az account show --only-show-errors | Out-Null }
+  try { & az account show --only-show-errors | Out-Null }
   catch {
     Write-Host "Signing into Azure (interactive)..." -ForegroundColor Yellow
-    az login --only-show-errors | Out-Null
+    & az login --only-show-errors | Out-Null
   }
 }
 
 function Resolve-ResourceGroup {
   param([string]$Rg)
 
-  if ($Rg) { return $Rg }
+  if ($Rg) { return $Rg.Trim() }
 
-  $matches = az group list --query "[?contains(name,'LAB565')].name" -o tsv --only-show-errors
+  $q = "[?contains(name, 'LAB565')].name"
+  $matches = & az group list --query $q -o tsv --only-show-errors
   if (-not $matches) {
     Fail "Couldn't auto-find a resource group containing 'LAB565'. Re-run with -ResourceGroupName <name>."
   }
@@ -58,7 +60,6 @@ function Resolve-ResourceGroup {
 
   if ($list.Count -eq 1) { return $list[0] }
 
-  # Try best guess: prefer something that looks like the lab RG
   $preferred = $list | Where-Object { $_ -match 'ResourceGroup' } | Select-Object -First 1
   if ($preferred) { return $preferred }
 
@@ -75,13 +76,13 @@ function Resolve-ResourceGroup {
 }
 
 function Ensure-ProviderRegistered($ns) {
-  $state = az provider show --namespace $ns --query registrationState -o tsv 2>$null
+  $state = & az provider show --namespace $ns --query registrationState -o tsv 2>$null
   if ($state -ne "Registered") {
-    az provider register --namespace $ns --only-show-errors | Out-Null
+    & az provider register --namespace $ns --only-show-errors | Out-Null
   }
 
   for ($i=0; $i -lt 60; $i++) {
-    $state = az provider show --namespace $ns --query registrationState -o tsv 2>$null
+    $state = & az provider show --namespace $ns --query registrationState -o tsv 2>$null
     if ($state -eq "Registered") { return }
     Start-Sleep -Seconds 5
   }
@@ -95,15 +96,15 @@ function Resolve-UserObjectId {
 
   # Attempt 1: signed-in-user (best)
   try {
-    $id = (az ad signed-in-user show --query id -o tsv 2>$null).Trim()
+    $id = (& az ad signed-in-user show --query id -o tsv 2>$null).Trim()
     if ($id) { return $id }
   } catch {}
 
   # Attempt 2: account UPN -> user show
   try {
-    $upn = (az account show --query user.name -o tsv 2>$null).Trim()
+    $upn = (& az account show --query user.name -o tsv 2>$null).Trim()
     if ($upn) {
-      $id = (az ad user show --id $upn --query id -o tsv 2>$null).Trim()
+      $id = (& az ad user show --id $upn --query id -o tsv 2>$null).Trim()
       if ($id) { return $id }
     }
   } catch {}
@@ -120,7 +121,7 @@ Ensure-LoggedIn
 $rg = Resolve-ResourceGroup $ResourceGroupName
 Write-Host "Using Resource Group: $rg" -ForegroundColor Cyan
 
-$rgLocation = (az group show -n $rg --query location -o tsv --only-show-errors).Trim()
+$rgLocation = (& az group show -n $rg --query location -o tsv --only-show-errors).Trim()
 Write-Host "RG Location: $rgLocation" -ForegroundColor Cyan
 
 # Providers needed by your template + container apps
@@ -134,7 +135,7 @@ Ensure-ProviderRegistered "Microsoft.Authorization"
 # -------------------------
 # ACR in same RG
 # -------------------------
-$subId = (az account show --query id -o tsv --only-show-errors).Trim()
+$subId = (& az account show --query id -o tsv --only-show-errors).Trim()
 
 $bytes  = [System.Text.Encoding]::UTF8.GetBytes("$subId|$rg")
 $sha    = [System.Security.Cryptography.SHA256]::Create()
@@ -143,12 +144,12 @@ $acrName = ("acrhrmcp" + $hash.Substring(0,18)).ToLower()
 
 Write-Host "ACR Name: $acrName" -ForegroundColor Cyan
 
-$acrExists = az acr show -g $rg -n $acrName --query name -o tsv 2>$null
+$acrExists = & az acr show -g $rg -n $acrName --query name -o tsv 2>$null
 if (-not $acrExists) {
   Write-Host "Creating ACR..." -ForegroundColor Yellow
-  az acr create -g $rg -n $acrName -l $rgLocation --sku Basic --admin-enabled true --only-show-errors | Out-Null
+  & az acr create -g $rg -n $acrName -l $rgLocation --sku Basic --admin-enabled true --only-show-errors | Out-Null
 } else {
-  az acr update -g $rg -n $acrName --admin-enabled true --only-show-errors | Out-Null
+  & az acr update -g $rg -n $acrName --admin-enabled true --only-show-errors | Out-Null
 }
 
 # -------------------------
@@ -172,16 +173,25 @@ if ((Get-Item $dockerfilePath).Length -lt 50) {
   Fail "Dockerfile download looks wrong/empty: $dockerfilePath"
 }
 
+# Make sure build context has a csproj (otherwise ACR build will fail later)
+$csproj = Get-ChildItem -Path $McpSourcePath -Filter *.csproj -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $csproj) {
+  Fail "No *.csproj found in $McpSourcePath. The Docker build context must include the app source, not just the Dockerfile."
+}
+
 # -------------------------
 # Build image in ACR (no Docker needed)
 # -------------------------
 $repo = "hr-mcp-server"
-$tagCount = az acr repository show-tags -n $acrName --repository $repo --query "[?@=='$ImageTag'] | length(@)" -o tsv 2>$null
+
+# PowerShell-safe JMESPath
+$qTags = "[?@=='$ImageTag'] | length(@)"
+$tagCount = & az acr repository show-tags -n $acrName --repository $repo --query $qTags -o tsv 2>$null
 
 if ($tagCount -ne "1") {
   Write-Host "Building container image in ACR (this can take a few minutes)..." -ForegroundColor Yellow
   Push-Location $McpSourcePath
-  az acr build -r $acrName -t "${repo}:${ImageTag}" . --only-show-errors
+  & az acr build -r $acrName -t "${repo}:${ImageTag}" . --only-show-errors
   Pop-Location
 } else {
   Write-Host "Image already exists: ${repo}:${ImageTag} (skipping build)" -ForegroundColor Green
@@ -195,6 +205,10 @@ $bicepPath = Join-Path $env:TEMP "LAB565.bicep"
 
 Write-Host "Downloading Bicep..." -ForegroundColor Yellow
 Invoke-WebRequest -Uri $bicepUrl -OutFile $bicepPath
+
+# Validate Bicep syntax early (catches copy/formatting issues)
+Write-Host "Validating Bicep..." -ForegroundColor Yellow
+& az bicep build --file $bicepPath | Out-Null
 
 $userObjectId = Resolve-UserObjectId $LabUserObjectId
 if (-not $userObjectId) {
@@ -213,7 +227,7 @@ $mcpKey = [guid]::NewGuid().ToString("N")
 $deploymentName = "deployment"
 
 Write-Host "Deploying resources..." -ForegroundColor Yellow
-az deployment group create `
+& az deployment group create `
   --name $deploymentName `
   --resource-group $rg `
   --template-file $bicepPath `
@@ -229,8 +243,8 @@ az deployment group create `
 # -------------------------
 # Output student copy/paste values
 # -------------------------
-$mcpBaseUrl = (az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpBaseUrl.value" -o tsv).Trim()
-$mcpHeader  = (az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpHeaderName.value" -o tsv).Trim()
+$mcpBaseUrl = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpBaseUrl.value" -o tsv).Trim()
+$mcpHeader  = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpHeaderName.value" -o tsv).Trim()
 
 ""
 "==== STUDENT COPY/PASTE ===="
@@ -241,19 +255,34 @@ $mcpHeader  = (az deployment group show -g $rg -n $deploymentName --query "prope
 ""
 
 # -------------------------
-# Quick smoke test (optional but helpful)
+# Quick smoke test
 # -------------------------
-Write-Host "Testing MCP URL..." -ForegroundColor Yellow
+Write-Host "Testing MCP URL (no header)..." -ForegroundColor Yellow
 try {
-  $r = Invoke-WebRequest -Uri $mcpBaseUrl -UseBasicParsing -TimeoutSec 20
+  $r = Invoke-WebRequest -Uri $mcpBaseUrl -UseBasicParsing -TimeoutSec 25
   Write-Host "MCP responded (HTTP $($r.StatusCode))." -ForegroundColor Green
 } catch {
-  Write-Host "MCP test call failed (this can be normal if API key enforcement returns 401)." -ForegroundColor Yellow
-  if ($_.Exception.Response) {
-    $code = [int]$_.Exception.Response.StatusCode
-    Write-Host "HTTP $code" -ForegroundColor Yellow
+  $code = $null
+  if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+  if ($code -in 401,403) {
+    Write-Host "MCP is reachable and enforcing auth (HTTP $code) ✅" -ForegroundColor Green
   } else {
-    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    Write-Host "MCP call failed (possible warmup/ingress/port issue)." -ForegroundColor Yellow
+    if ($code) { Write-Host "HTTP $code" -ForegroundColor Yellow }
+    else { Write-Host $_.Exception.Message -ForegroundColor Yellow }
+    Write-Host "If you see 502/503, check Container App revision/logs (often port mismatch or app crash)." -ForegroundColor Yellow
   }
-  Write-Host "If you see 502/503, check Container App logs (likely port mismatch)." -ForegroundColor Yellow
+}
+
+if ($mcpHeader -and $mcpKey) {
+  Write-Host "Testing MCP URL (with header)..." -ForegroundColor Yellow
+  try {
+    $headers = @{ $mcpHeader = $mcpKey }
+    $r2 = Invoke-WebRequest -Uri $mcpBaseUrl -Headers $headers -UseBasicParsing -TimeoutSec 25
+    Write-Host "MCP responded with header (HTTP $($r2.StatusCode)). ✅" -ForegroundColor Green
+  } catch {
+    $code2 = $null
+    if ($_.Exception.Response) { $code2 = [int]$_.Exception.Response.StatusCode }
+    Write-Host "Header test returned HTTP $code2 (this may be OK depending on your app routes)." -ForegroundColor Yellow
+  }
 }
