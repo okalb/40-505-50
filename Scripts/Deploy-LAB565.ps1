@@ -1,28 +1,28 @@
 <# 
-Deploy-LAB565.ps1
+Deploy-LAB565.ps1 (student-run)
 - Interactive az login
-- Find target RG (or use provided)
+- Choose/find target RG
 - Ensure ACR exists (in same RG)
 - Download Dockerfile/.dockerignore into C:\labs\hr-mcp-server
 - ACR cloud build (no Docker required)
 - Deploy Bicep
 - Print MCP URL + header + API key
+- Quick smoke test
 #>
 
 [CmdletBinding()]
 param(
-  # Change only if you rename the repo/branch
   [string]$RepoOwner = "okalb",
   [string]$RepoName  = "40-505-50",
   [string]$Branch    = "main",
 
-  # If blank, script will auto-find an RG containing 'LAB565'
+  # Optional: specify RG explicitly to avoid ambiguity
   [string]$ResourceGroupName = "",
 
-  # Local path on the lab VM where the MCP server source code lives
-  [string]$McpSourcePath = "C:\labs\hr-mcp-server",
+  # Optional: if Entra lookup is blocked, instructor can provide this
+  [string]$LabUserObjectId = "",
 
-  # Image tag
+  [string]$McpSourcePath = "C:\labs\hr-mcp-server",
   [string]$ImageTag = "v1"
 )
 
@@ -37,9 +37,8 @@ function Require-AzCli {
 }
 
 function Ensure-LoggedIn {
-  try {
-    az account show --only-show-errors | Out-Null
-  } catch {
+  try { az account show --only-show-errors | Out-Null }
+  catch {
     Write-Host "Signing into Azure (interactive)..." -ForegroundColor Yellow
     az login --only-show-errors | Out-Null
   }
@@ -50,14 +49,29 @@ function Resolve-ResourceGroup {
 
   if ($Rg) { return $Rg }
 
-  # Prefer RGs that include LAB565
-  $candidates = az group list --query "[?contains(name,'LAB565')].[name]" -o tsv --only-show-errors
-  if (-not $candidates) {
+  $matches = az group list --query "[?contains(name,'LAB565')].name" -o tsv --only-show-errors
+  if (-not $matches) {
     Fail "Couldn't auto-find a resource group containing 'LAB565'. Re-run with -ResourceGroupName <name>."
   }
 
-  # If multiple, pick the first
-  return ($candidates | Select-Object -First 1).Trim()
+  $list = @($matches | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+  if ($list.Count -eq 1) { return $list[0] }
+
+  # Try best guess: prefer something that looks like the lab RG
+  $preferred = $list | Where-Object { $_ -match 'ResourceGroup' } | Select-Object -First 1
+  if ($preferred) { return $preferred }
+
+  Write-Host ""
+  Write-Host "Multiple resource groups match 'LAB565'. Choose one:" -ForegroundColor Yellow
+  for ($i=0; $i -lt $list.Count; $i++) {
+    Write-Host ("[{0}] {1}" -f ($i+1), $list[$i])
+  }
+  $choice = Read-Host "Enter a number"
+  if ($choice -notmatch '^\d+$') { Fail "Invalid choice." }
+  $idx = [int]$choice - 1
+  if ($idx -lt 0 -or $idx -ge $list.Count) { Fail "Choice out of range." }
+  return $list[$idx]
 }
 
 function Ensure-ProviderRegistered($ns) {
@@ -74,6 +88,32 @@ function Ensure-ProviderRegistered($ns) {
   Fail "Provider $ns did not reach Registered state in time."
 }
 
+function Resolve-UserObjectId {
+  param([string]$Override)
+
+  if ($Override) { return $Override.Trim() }
+
+  # Attempt 1: signed-in-user (best)
+  try {
+    $id = (az ad signed-in-user show --query id -o tsv 2>$null).Trim()
+    if ($id) { return $id }
+  } catch {}
+
+  # Attempt 2: account UPN -> user show
+  try {
+    $upn = (az account show --query user.name -o tsv 2>$null).Trim()
+    if ($upn) {
+      $id = (az ad user show --id $upn --query id -o tsv 2>$null).Trim()
+      if ($id) { return $id }
+    }
+  } catch {}
+
+  return ""
+}
+
+# -------------------------
+# Start
+# -------------------------
 Require-AzCli
 Ensure-LoggedIn
 
@@ -96,7 +136,6 @@ Ensure-ProviderRegistered "Microsoft.Authorization"
 # -------------------------
 $subId = (az account show --query id -o tsv --only-show-errors).Trim()
 
-# Avoid collisions: hash includes subscription + rg
 $bytes  = [System.Text.Encoding]::UTF8.GetBytes("$subId|$rg")
 $sha    = [System.Security.Cryptography.SHA256]::Create()
 $hash   = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
@@ -142,7 +181,7 @@ $tagCount = az acr repository show-tags -n $acrName --repository $repo --query "
 if ($tagCount -ne "1") {
   Write-Host "Building container image in ACR (this can take a few minutes)..." -ForegroundColor Yellow
   Push-Location $McpSourcePath
-  az acr build -r $acrName -t "$repo:$ImageTag" . --only-show-errors | Out-Null
+  az acr build -r $acrName -t "$repo:$ImageTag" . --only-show-errors
   Pop-Location
 } else {
   Write-Host "Image already exists: $repo:$ImageTag (skipping build)" -ForegroundColor Green
@@ -157,10 +196,17 @@ $bicepPath = Join-Path $env:TEMP "LAB565.bicep"
 Write-Host "Downloading Bicep..." -ForegroundColor Yellow
 Invoke-WebRequest -Uri $bicepUrl -OutFile $bicepPath
 
-# Lab user object id: simplest approach is the signed-in user
-$userObjectId = (az ad signed-in-user show --query id -o tsv 2>$null).Trim()
+$userObjectId = Resolve-UserObjectId $LabUserObjectId
 if (-not $userObjectId) {
-  Fail "Couldn't determine signed-in user object id. Make sure your account can query Entra ID."
+  Write-Host ""
+  Write-Host "ERROR: Couldn't determine your Entra user Object ID." -ForegroundColor Red
+  Write-Host "This is required because the Bicep assigns roles to the lab user." -ForegroundColor Yellow
+  Write-Host ""
+  Write-Host "Fix options:" -ForegroundColor Cyan
+  Write-Host "  1) Re-run the script with: -LabUserObjectId <GUID>" -ForegroundColor Cyan
+  Write-Host "  2) Or remove the 'LAB USER ROLE ASSIGNMENTS' section from the Bicep if not needed." -ForegroundColor Cyan
+  Write-Host ""
+  Fail "Missing labUserObjectId"
 }
 
 $mcpKey = [guid]::NewGuid().ToString("N")
@@ -171,13 +217,14 @@ az deployment group create `
   --name $deploymentName `
   --resource-group $rg `
   --template-file $bicepPath `
-  --parameters labUserObjectId="$userObjectId" `
-              location="$rgLocation" `
-              acrResourceGroup="$rg" `
-              acrName="$acrName" `
-              mcpImageTag="$ImageTag" `
-              mcpApiKey="$mcpKey" `
-  --only-show-errors | Out-Null
+  --parameters `
+      labUserObjectId="$userObjectId" `
+      location="$rgLocation" `
+      acrResourceGroup="$rg" `
+      acrName="$acrName" `
+      mcpImageTag="$ImageTag" `
+      mcpApiKey="$mcpKey" `
+  --only-show-errors
 
 # -------------------------
 # Output student copy/paste values
@@ -192,3 +239,21 @@ $mcpHeader  = (az deployment group show -g $rg -n $deploymentName --query "prope
 "API Key     : $mcpKey"
 "==========================="
 ""
+
+# -------------------------
+# Quick smoke test (optional but helpful)
+# -------------------------
+Write-Host "Testing MCP URL..." -ForegroundColor Yellow
+try {
+  $r = Invoke-WebRequest -Uri $mcpBaseUrl -UseBasicParsing -TimeoutSec 20
+  Write-Host "MCP responded (HTTP $($r.StatusCode))." -ForegroundColor Green
+} catch {
+  Write-Host "MCP test call failed (this can be normal if API key enforcement returns 401)." -ForegroundColor Yellow
+  if ($_.Exception.Response) {
+    $code = [int]$_.Exception.Response.StatusCode
+    Write-Host "HTTP $code" -ForegroundColor Yellow
+  } else {
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
+  }
+  Write-Host "If you see 502/503, check Container App logs (likely port mismatch)." -ForegroundColor Yellow
+}
