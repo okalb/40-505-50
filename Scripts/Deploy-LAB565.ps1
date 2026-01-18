@@ -181,10 +181,10 @@ $tagCount = az acr repository show-tags -n $acrName --repository $repo --query "
 if ($tagCount -ne "1") {
   Write-Host "Building container image in ACR (this can take a few minutes)..." -ForegroundColor Yellow
   Push-Location $McpSourcePath
-  az acr build -r $acrName -t "$repo:$ImageTag" . --only-show-errors
+  az acr build -r $acrName -t "${repo}:${ImageTag}" . --only-show-errors
   Pop-Location
 } else {
-  Write-Host "Image already exists: $repo:$ImageTag (skipping build)" -ForegroundColor Green
+  Write-Host "Image already exists: ${repo}:${ImageTag} (skipping build)" -ForegroundColor Green
 }
 
 # -------------------------
