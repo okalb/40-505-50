@@ -373,7 +373,7 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   scope: resourceGroup(acrResourceGroup)
 }
 
-var acrCreds = listCredentials(acr.id, acr.apiVersion)
+var acrCreds = acr.listCredentials()
 var mcpImage = '${acr.properties.loginServer}/hr-mcp-server:${mcpImageTag}'
 
 resource mcpEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
