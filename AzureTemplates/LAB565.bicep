@@ -10,8 +10,8 @@ param labUserObjectId string
 @description('The name prefix for all resources')
 param resourcePrefix string = 'lab565'
 
-@description('The location where all resources will be deployed')
-param location string = resourceGroup().location
+@description('The location where all resources will be deployed (fallback only)')
+param location string = 'eastus'
 
 @description('Storage account SKU')
 @allowed([
@@ -59,10 +59,10 @@ param embeddingModelCapacity int = 30
 // PARAMS: Hosted MCP Server (Container Apps)
 // ===============================================
 
-@description('Resource group that hosts the ACR (registry)')
+@description('Shared resource group that hosts the ACR (registry)')
 param acrResourceGroup string
 
-@description('ACR name (lowercase, globally unique)')
+@description('Shared ACR name (lowercase, globally unique)')
 param acrName string
 
 @description('MCP image tag in ACR (example: v1)')
@@ -73,12 +73,12 @@ param mcpImageTag string = 'v1'
 param mcpApiKey string
 
 // ===============================================
-// Vars
+// LOCATION
 // ===============================================
+var rgLocation = empty(location) ? resourceGroup().location : location
 
-var rgLocation = location
+// Variables for resource naming and configuration
 var uniqueSuffix = uniqueString(resourceGroup().id)
-
 var resourceNames = {
   storageAccount: '${resourcePrefix}st${uniqueSuffix}'
   searchService: '${resourcePrefix}-search-${uniqueSuffix}'
@@ -86,14 +86,19 @@ var resourceNames = {
   embeddingDeployment: 'text-embedding'
 }
 
+// Ensure storage account name meets requirements (3-24 chars, lowercase alphanumeric)
 var storageAccountName = length(resourceNames.storageAccount) > 24
   ? substring(resourceNames.storageAccount, 0, 24)
   : resourceNames.storageAccount
+
+// Avoid decimal literal for older Bicep parsers
+var mcpCpu = json('0.25')
 
 // ===============================================
 // AZURE STORAGE ACCOUNT
 // ===============================================
 
+@description('Azure Storage Account for document storage and processing')
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
   location: rgLocation
@@ -156,6 +161,7 @@ resource resumesContainer 'Microsoft.Storage/storageAccounts/blobServices/contai
 // AZURE AI SEARCH SERVICE
 // ===============================================
 
+@description('Azure AI Search service for vector search and document indexing')
 resource searchService 'Microsoft.Search/searchServices@2023-11-01' = {
   name: resourceNames.searchService
   location: rgLocation
@@ -190,6 +196,7 @@ resource searchService 'Microsoft.Search/searchServices@2023-11-01' = {
 // AZURE OPENAI SERVICE
 // ===============================================
 
+@description('Azure OpenAI service for AI models and embeddings')
 resource openAiService 'Microsoft.CognitiveServices/accounts@2023-10-01-preview' = {
   name: resourceNames.openAiService
   location: rgLocation
@@ -219,6 +226,7 @@ resource openAiService 'Microsoft.CognitiveServices/accounts@2023-10-01-preview'
 // TEXT EMBEDDING MODEL DEPLOYMENT
 // ===============================================
 
+@description('Text embedding model deployment for vector generation')
 resource embeddingModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2023-10-01-preview' = {
   parent: openAiService
   name: resourceNames.embeddingDeployment
@@ -237,7 +245,7 @@ resource embeddingModelDeployment 'Microsoft.CognitiveServices/accounts/deployme
 }
 
 // ===============================================
-// SECURITY ROLE ASSIGNMENTS (Search Service MSI)
+// SECURITY ROLE ASSIGNMENTS
 // ===============================================
 
 resource CogsUserSPRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -250,7 +258,7 @@ resource CogsUserSPRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-
 }
 
 resource openAiRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, searchService.name, 'sp-openai-user', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')
+  name: guid(subscription().id, resourceGroup().id, searchService.name, '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')
   properties: {
     principalId: searchService.identity.principalId
     principalType: 'ServicePrincipal'
@@ -259,7 +267,7 @@ resource openAiRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-0
 }
 
 resource storageReaderRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, searchService.name, 'sp-blob-reader', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+  name: guid(subscription().id, resourceGroup().id, searchService.name, '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
   properties: {
     principalId: searchService.identity.principalId
     principalType: 'ServicePrincipal'
@@ -268,7 +276,7 @@ resource storageReaderRoleAssignment 'Microsoft.Authorization/roleAssignments@20
 }
 
 resource storageContributorRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, searchService.name, 'sp-blob-contrib', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  name: guid(subscription().id, resourceGroup().id, searchService.name, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
   properties: {
     principalId: searchService.identity.principalId
     principalType: 'ServicePrincipal'
@@ -281,7 +289,7 @@ resource storageContributorRoleAssignment 'Microsoft.Authorization/roleAssignmen
 // ===============================================
 
 resource userRgContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, labUserObjectId, 'user-rg-contributor', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
+  name: guid(subscription().id, resourceGroup().id, labUserObjectId, 'b24988ac-6180-42a0-ab88-20f7382dd24c')
   scope: resourceGroup()
   properties: {
     principalId: labUserObjectId
@@ -291,7 +299,7 @@ resource userRgContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' 
 }
 
 resource userStorageContributorRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, storageAccount.name, labUserObjectId, 'user-blob-contrib', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  name: guid(subscription().id, resourceGroup().id, storageAccount.name, labUserObjectId, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
   scope: storageAccount
   properties: {
     principalId: labUserObjectId
@@ -301,7 +309,7 @@ resource userStorageContributorRoleAssignment 'Microsoft.Authorization/roleAssig
 }
 
 resource userSearchContributorRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, searchService.name, labUserObjectId, 'user-search-contrib', '7ca78c08-252a-4471-8644-bb5ff32d4ba0')
+  name: guid(subscription().id, resourceGroup().id, searchService.name, labUserObjectId, '7ca78c08-252a-4471-8644-bb5ff32d4ba0')
   scope: searchService
   properties: {
     principalId: labUserObjectId
@@ -311,7 +319,7 @@ resource userSearchContributorRoleAssignment 'Microsoft.Authorization/roleAssign
 }
 
 resource userSearchIndexContributorRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, searchService.name, labUserObjectId, 'user-search-index-reader', '1407120a-92aa-4202-b7e9-c0e197c71c8f')
+  name: guid(subscription().id, resourceGroup().id, searchService.name, labUserObjectId, '1407120a-92aa-4202-b7e9-c0e197c71c8f')
   scope: searchService
   properties: {
     principalId: labUserObjectId
@@ -321,7 +329,7 @@ resource userSearchIndexContributorRoleAssignment 'Microsoft.Authorization/roleA
 }
 
 resource userOpenAiContributorRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, openAiService.name, labUserObjectId, 'user-cogs-contrib', '25fbc0a9-bd7c-42a3-aa1a-3b75d497ee68')
+  name: guid(subscription().id, resourceGroup().id, openAiService.name, labUserObjectId, '25fbc0a9-bd7c-42a3-aa1a-3b75d497ee68')
   scope: openAiService
   properties: {
     principalId: labUserObjectId
@@ -331,7 +339,7 @@ resource userOpenAiContributorRoleAssignment 'Microsoft.Authorization/roleAssign
 }
 
 resource userOpenAiUserRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, openAiService.name, labUserObjectId, 'user-openai-user', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')
+  name: guid(subscription().id, resourceGroup().id, openAiService.name, labUserObjectId, '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')
   scope: openAiService
   properties: {
     principalId: labUserObjectId
@@ -365,16 +373,13 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   scope: resourceGroup(acrResourceGroup)
 }
 
-// Use the broadly-compatible listCredentials() form
 var acrCreds = listCredentials(acr.id, acr.apiVersion)
 var mcpImage = '${acr.properties.loginServer}/hr-mcp-server:${mcpImageTag}'
 
 resource mcpEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: mcpEnvName
   location: rgLocation
-  properties: {
-    // omit appLogsConfiguration entirely (avoids schema friction)
-  }
+  properties: {}
 }
 
 resource mcpApp 'Microsoft.App/containerApps@2024-03-01' = {
@@ -389,12 +394,6 @@ resource mcpApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 8080
         transport: 'auto'
         allowInsecure: false
-        traffic: [
-          {
-            latestRevision: true
-            weight: 100
-          }
-        ]
       }
       registries: [
         {
@@ -434,7 +433,7 @@ resource mcpApp 'Microsoft.App/containerApps@2024-03-01' = {
             }
           ]
           resources: {
-            cpu: '0.25'
+            cpu: mcpCpu
             memory: '0.5Gi'
           }
         }
@@ -482,7 +481,7 @@ output resourceGroupLocation string = rgLocation
 output uniqueSuffix string = uniqueSuffix
 
 @description('Lab user object ID')
-output labUserObjectIdOut string = labUserObjectId
+output labUserObjectId string = labUserObjectId
 
 @description('Hosted MCP base URL (students paste into Copilot Studio)')
 output mcpBaseUrl string = 'https://${mcpApp.properties.configuration.ingress.fqdn}'
