@@ -35,12 +35,26 @@ function Require-AzCli {
 }
 
 function Ensure-LoggedIn {
-  try { & az account show --only-show-errors | Out-Null }
-  catch {
+  # Check if we can get a management (ARM) access token
+  & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 1>$null 2>$null
+
+  if ($LASTEXITCODE -ne 0) {
     Write-Host "Signing into Azure (interactive)..." -ForegroundColor Yellow
+
+    # Browser login (default)
     & az login --only-show-errors | Out-Null
+
+    # If browser auth is flaky in your lab, use device code instead:
+    # & az login --use-device-code --only-show-errors | Out-Null
+
+    # Re-check token to confirm login succeeded
+    & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 1>$null 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      Fail "Azure CLI login did not complete successfully."
+    }
   }
 }
+
 
 function Resolve-ResourceGroup {
   param([string]$Rg)
