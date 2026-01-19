@@ -1,12 +1,13 @@
 <# 
-Deploy-LAB565.ps1 (student-run)
+Deploy-MCP.ps1 (student-run)
 - Uses existing RG: RG1 (no discovery/prompting)
 - Prompts interactive az login only when required
 - Ensures ACR exists + admin enabled
-- ACR cloud build
+- ACR cloud build (no Docker required)
 - Deploys MCP-only Bicep
 - Writes MCP_Info.txt to Desktop
 - Writes a log file to C:\labs\deploy for troubleshooting
+- Closes the PowerShell window when done (success or failure)
 #>
 
 [CmdletBinding()]
@@ -15,7 +16,7 @@ param(
   [string]$RepoName  = "40-505-50",
   [string]$Branch    = "main",
 
-  # Keep param for compatibility, but ignored unless you want to override later
+  # Always use RG1 (you can override if you ever need to, but no discovery/prompting)
   [string]$ResourceGroupName = "RG1",
 
   [string]$McpSourcePath = "C:\labs\hr-mcp-server",
@@ -23,8 +24,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$global:ExitCode = 0
 
-function Fail($msg) { throw $msg }
+function Fail([string]$msg) { throw $msg }
 
 function Require-AzCli {
   if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
@@ -32,18 +34,57 @@ function Require-AzCli {
   }
 }
 
+function Invoke-WebRequestSafe {
+  param(
+    [Parameter(Mandatory=$true)][string]$Uri,
+    [Parameter(Mandatory=$true)][string]$OutFile
+  )
+
+  # PowerShell 5.1 sometimes needs TLS 1.2 explicitly, and -UseBasicParsing avoids IE dependencies.
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  } catch {}
+
+  if ($PSVersionTable.PSVersion.Major -lt 6) {
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+  } else {
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile
+  }
+}
+
 function Ensure-LoggedIn {
-  # Try to fetch a management plane token (strong login signal)
-  $token = & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 2>$null
-  if ($LASTEXITCODE -ne 0 -or -not $token) {
+  # IMPORTANT: In Windows PowerShell, native stderr can become a terminating error when $ErrorActionPreference="Stop".
+  # So we temporarily relax it for the token probe.
+  $oldEAP = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $token = & az account get-access-token `
+      --resource https://management.azure.com/ `
+      --query accessToken -o tsv --only-show-errors 2>$null
+    $code = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $oldEAP
+  }
+
+  if ($code -ne 0 -or -not $token) {
     Write-Host "Signing into Azure (interactive)..." -ForegroundColor Yellow
-
-    # Browser login (default). Switch to --use-device-code if your lab browser auth is flaky.
     & az login --only-show-errors | Out-Null
-    # & az login --use-device-code --only-show-errors | Out-Null
 
-    $token = & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $token) {
+    # Re-check token (same safe pattern)
+    $oldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      $token = & az account get-access-token `
+        --resource https://management.azure.com/ `
+        --query accessToken -o tsv --only-show-errors 2>$null
+      $code = $LASTEXITCODE
+    }
+    finally {
+      $ErrorActionPreference = $oldEAP
+    }
+
+    if ($code -ne 0 -or -not $token) {
       Fail "Azure CLI login did not complete successfully."
     }
   }
@@ -66,7 +107,7 @@ function Get-DesktopPath {
   return $desktop
 }
 
-function Ensure-ProviderRegistered($ns) {
+function Ensure-ProviderRegistered([string]$ns) {
   $state = & az provider show --namespace $ns --query registrationState -o tsv 2>$null
   if ($state -ne "Registered") {
     & az provider register --namespace $ns --only-show-errors | Out-Null
@@ -81,11 +122,12 @@ function Ensure-ProviderRegistered($ns) {
 }
 
 # -------------------------
-# Logging to a file (helps when users double-click / right-click)
+# Logging (so failures are diagnosable even if the window closes)
 # -------------------------
 $logDir = "C:\labs\deploy"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-$logPath = Join-Path $logDir ("Deploy-LAB565_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$logPath = Join-Path $logDir ("Deploy-MCP_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+
 Start-Transcript -Path $logPath -Append | Out-Null
 
 try {
@@ -96,22 +138,19 @@ try {
 
   Ensure-LoggedIn
 
-  # Always use RG1 (or ResourceGroupName param defaulting to RG1)
-  $rg = $ResourceGroupName.Trim()
+  # Always use RG1 (no prompting)
+  $rg = ($ResourceGroupName ?? "").Trim()
   if (-not $rg) { $rg = "RG1" }
 
   $rgExists = & az group exists -n $rg --only-show-errors 2>$null
   if ($LASTEXITCODE -ne 0) { Fail "Failed to check if resource group '$rg' exists." }
   if ($rgExists -ne "true") { Fail "Resource group '$rg' does not exist. Ensure RG1 exists before running." }
 
-  Write-Host "Using Resource Group: $rg" -ForegroundColor Cyan
-
   $rgLocation = & az group show -n $rg --query location -o tsv --only-show-errors 2>$null
   if ($LASTEXITCODE -ne 0 -or -not $rgLocation) { Fail "Failed to resolve location for resource group '$rg'." }
   $rgLocation = $rgLocation.Trim()
-  Write-Host "RG Location: $rgLocation" -ForegroundColor Cyan
 
-  # Providers
+  # Providers (may require subscription-level permissions)
   Ensure-ProviderRegistered "Microsoft.App"
   Ensure-ProviderRegistered "Microsoft.ContainerRegistry"
 
@@ -127,11 +166,9 @@ try {
   $hash   = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
   $acrName = ("acrhrmcp" + $hash.Substring(0,18)).ToLower()
 
-  Write-Host "ACR Name: $acrName" -ForegroundColor Cyan
-
   $acrExists = & az acr show -g $rg -n $acrName --query name -o tsv 2>$null
   if (-not $acrExists) {
-    Write-Host "Creating ACR..." -ForegroundColor Yellow
+    Write-Host "Creating ACR: $acrName" -ForegroundColor Yellow
     & az acr create -g $rg -n $acrName -l $rgLocation --sku Basic --admin-enabled true --only-show-errors | Out-Null
   } else {
     & az acr update -g $rg -n $acrName --admin-enabled true --only-show-errors | Out-Null
@@ -150,9 +187,8 @@ try {
   $dockerfilePath   = Join-Path $McpSourcePath "Dockerfile"
   $dockerignorePath = Join-Path $McpSourcePath ".dockerignore"
 
-  Write-Host "Downloading Dockerfile + .dockerignore..." -ForegroundColor Yellow
-  Invoke-WebRequest -Uri $dockerfileUrl -OutFile $dockerfilePath
-  Invoke-WebRequest -Uri $dockerignoreUrl -OutFile $dockerignorePath
+  Invoke-WebRequestSafe -Uri $dockerfileUrl   -OutFile $dockerfilePath
+  Invoke-WebRequestSafe -Uri $dockerignoreUrl -OutFile $dockerignorePath
 
   if ((Get-Item $dockerfilePath).Length -lt 50) {
     Fail "Dockerfile download looks wrong/empty: $dockerfilePath"
@@ -176,80 +212,63 @@ try {
     Push-Location $McpSourcePath
     & az acr build -r $acrName -t "${repo}:${ImageTag}" . --only-show-errors
     Pop-Location
-  } else {
-    Write-Host "Image already exists: ${repo}:${ImageTag} (skipping build)" -ForegroundColor Green
   }
 
   # -------------------------
-  # Deploy Bicep
+  # Deploy Bicep (MCP-only template)
   # -------------------------
   $bicepUrl  = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/AzureTemplates/LAB565.bicep"
   $bicepPath = Join-Path $env:TEMP "LAB565.bicep"
 
-  Write-Host "Downloading Bicep..." -ForegroundColor Yellow
-  Invoke-WebRequest -Uri $bicepUrl -OutFile $bicepPath
-
-  Write-Host "Validating Bicep..." -ForegroundColor Yellow
+  Invoke-WebRequestSafe -Uri $bicepUrl -OutFile $bicepPath
   & az bicep build --file $bicepPath | Out-Null
 
   $mcpKey = [guid]::NewGuid().ToString("N")
   $deploymentName = "deployment"
 
-  Write-Host "Deploying resources..." -ForegroundColor Yellow
   & az deployment group create `
     --name $deploymentName `
     --resource-group $rg `
     --template-file $bicepPath `
     --parameters `
-        location="$rgLocation" `
-        acrResourceGroup="$rg" `
-        acrName="$acrName" `
-        mcpImageTag="$ImageTag" `
-        mcpApiKey="$mcpKey" `
+      location="$rgLocation" `
+      acrResourceGroup="$rg" `
+      acrName="$acrName" `
+      mcpImageTag="$ImageTag" `
+      mcpApiKey="$mcpKey" `
     --only-show-errors | Out-Null
 
   # -------------------------
-  # Outputs
+  # Read outputs + write Desktop file (success signal)
   # -------------------------
   $mcpBaseUrl = & az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpBaseUrl.value" -o tsv --only-show-errors 2>$null
   $mcpHeader  = & az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpHeaderName.value" -o tsv --only-show-errors 2>$null
   if ($LASTEXITCODE -ne 0 -or -not $mcpBaseUrl -or -not $mcpHeader) { Fail "Failed to read deployment outputs." }
 
-  $mcpBaseUrl = $mcpBaseUrl.Trim()
-  $mcpHeader  = $mcpHeader.Trim()
-
-  ""
-  "==== STUDENT COPY/PASTE ===="
-  "MCP Base URL : $mcpBaseUrl"
-  "Header Name : $mcpHeader"
-  "API Key     : $mcpKey"
-  "==========================="
-  ""
-
-  # Write to Desktop
   $desktop = Get-DesktopPath
   $outFile = Join-Path $desktop "MCP_Info.txt"
 
   $content = @(
     "==== STUDENT COPY/PASTE ===="
-    "MCP Base URL : $mcpBaseUrl"
-    "Header Name : $mcpHeader"
-    "API Key     : $mcpKey"
+    ("MCP Base URL : {0}" -f $mcpBaseUrl.Trim())
+    ("Header Name : {0}" -f $mcpHeader.Trim())
+    ("API Key     : {0}" -f $mcpKey)
     "==========================="
   )
   Set-Content -Path $outFile -Value $content -Encoding UTF8 -Force
 
-  Write-Host "Wrote MCP info file to: $outFile" -ForegroundColor Green
+  Write-Host "Deployment complete. MCP_Info.txt written to Desktop." -ForegroundColor Green
   Write-Host "Log file: $logPath" -ForegroundColor Cyan
 }
 catch {
+  $global:ExitCode = 1
   Write-Host ""
-  Write-Host "Deployment failed: $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host "Deployment finished with errors." -ForegroundColor Red
   Write-Host "Log file: $logPath" -ForegroundColor Yellow
-  Write-Host "If you launched this by right-clicking, use the CMD wrapper so the window stays open." -ForegroundColor Yellow
-  throw
 }
 finally {
   try { Stop-Transcript | Out-Null } catch {}
 }
-exit
+
+# Always close the PowerShell window/process when done
+exit $global:ExitCode
