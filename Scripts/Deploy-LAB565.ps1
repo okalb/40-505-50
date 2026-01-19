@@ -1,14 +1,12 @@
 <# 
 Deploy-LAB565.ps1 (student-run)
-- Interactive az login (only if not already logged in)
-- Choose/find target RG
-- Ensure ACR exists (in same RG) + admin enabled (needed for Bicep listCredentials pattern)
-- Download Dockerfile/.dockerignore into C:\labs\hr-mcp-server
-- ACR cloud build (no Docker required)
-- Download + validate Bicep
-- Deploy Bicep (MCP-only version)
-- Print MCP URL + header + API key
-- Write copy/paste values to Desktop file (MCP_Info.txt)
+- Uses existing RG: RG1 (no discovery/prompting)
+- Prompts interactive az login only when required
+- Ensures ACR exists + admin enabled
+- ACR cloud build
+- Deploys MCP-only Bicep
+- Writes MCP_Info.txt to Desktop
+- Writes a log file to C:\labs\deploy for troubleshooting
 #>
 
 [CmdletBinding()]
@@ -17,8 +15,8 @@ param(
   [string]$RepoName  = "40-505-50",
   [string]$Branch    = "main",
 
-  # Optional: specify RG explicitly to avoid ambiguity
-  [string]$ResourceGroupName = "",
+  # Keep param for compatibility, but ignored unless you want to override later
+  [string]$ResourceGroupName = "RG1",
 
   [string]$McpSourcePath = "C:\labs\hr-mcp-server",
   [string]$ImageTag = "v1"
@@ -35,55 +33,37 @@ function Require-AzCli {
 }
 
 function Ensure-LoggedIn {
-  # Check if we can get a management (ARM) access token
-  & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 1>$null 2>$null
-
-  if ($LASTEXITCODE -ne 0) {
+  # Try to fetch a management plane token (strong login signal)
+  $token = & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $token) {
     Write-Host "Signing into Azure (interactive)..." -ForegroundColor Yellow
 
-    # Browser login (default)
+    # Browser login (default). Switch to --use-device-code if your lab browser auth is flaky.
     & az login --only-show-errors | Out-Null
-
-    # If browser auth is flaky in your lab, use device code instead:
     # & az login --use-device-code --only-show-errors | Out-Null
 
-    # Re-check token to confirm login succeeded
-    & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 1>$null 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $token = & az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv --only-show-errors 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $token) {
       Fail "Azure CLI login did not complete successfully."
     }
   }
+
+  # Ensure there is an active subscription context
+  $subId = & az account show --query id -o tsv --only-show-errors 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $subId) {
+    Fail "Azure CLI has no active subscription context. Use: az account list, then az account set -s <subscriptionId>."
+  }
 }
 
-
-function Resolve-ResourceGroup {
-  param([string]$Rg)
-
-  if ($Rg) { return $Rg.Trim() }
-
-  $q = "[?contains(name, 'LAB565')].name"
-  $matches = & az group list --query $q -o tsv --only-show-errors
-  if (-not $matches) {
-    Fail "Couldn't auto-find a resource group containing 'LAB565'. Re-run with -ResourceGroupName <name>."
+function Get-DesktopPath {
+  $desktop = [Environment]::GetFolderPath('Desktop')
+  if (-not $desktop -or -not (Test-Path $desktop)) {
+    $desktop = Join-Path $env:USERPROFILE "Desktop"
   }
-
-  $list = @($matches | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-
-  if ($list.Count -eq 1) { return $list[0] }
-
-  $preferred = $list | Where-Object { $_ -match 'ResourceGroup' } | Select-Object -First 1
-  if ($preferred) { return $preferred }
-
-  Write-Host ""
-  Write-Host "Multiple resource groups match 'LAB565'. Choose one:" -ForegroundColor Yellow
-  for ($i=0; $i -lt $list.Count; $i++) {
-    Write-Host ("[{0}] {1}" -f ($i+1), $list[$i])
+  if (-not (Test-Path $desktop)) {
+    Fail "Could not resolve a Desktop path for this user profile."
   }
-  $choice = Read-Host "Enter a number"
-  if ($choice -notmatch '^\d+$') { Fail "Invalid choice." }
-  $idx = [int]$choice - 1
-  if ($idx -lt 0 -or $idx -ge $list.Count) { Fail "Choice out of range." }
-  return $list[$idx]
+  return $desktop
 }
 
 function Ensure-ProviderRegistered($ns) {
@@ -100,156 +80,175 @@ function Ensure-ProviderRegistered($ns) {
   Fail "Provider $ns did not reach Registered state in time."
 }
 
-function Get-DesktopPath {
-  $desktop = [Environment]::GetFolderPath('Desktop')
-  if (-not $desktop -or -not (Test-Path $desktop)) {
-    $desktop = Join-Path $env:USERPROFILE "Desktop"
+# -------------------------
+# Logging to a file (helps when users double-click / right-click)
+# -------------------------
+$logDir = "C:\labs\deploy"
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+$logPath = Join-Path $logDir ("Deploy-LAB565_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+Start-Transcript -Path $logPath -Append | Out-Null
+
+try {
+  Require-AzCli
+
+  # Reduce noise
+  & az config set core.only_show_errors=yes --only-show-errors | Out-Null
+
+  Ensure-LoggedIn
+
+  # Always use RG1 (or ResourceGroupName param defaulting to RG1)
+  $rg = $ResourceGroupName.Trim()
+  if (-not $rg) { $rg = "RG1" }
+
+  $rgExists = & az group exists -n $rg --only-show-errors 2>$null
+  if ($LASTEXITCODE -ne 0) { Fail "Failed to check if resource group '$rg' exists." }
+  if ($rgExists -ne "true") { Fail "Resource group '$rg' does not exist. Ensure RG1 exists before running." }
+
+  Write-Host "Using Resource Group: $rg" -ForegroundColor Cyan
+
+  $rgLocation = & az group show -n $rg --query location -o tsv --only-show-errors 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $rgLocation) { Fail "Failed to resolve location for resource group '$rg'." }
+  $rgLocation = $rgLocation.Trim()
+  Write-Host "RG Location: $rgLocation" -ForegroundColor Cyan
+
+  # Providers
+  Ensure-ProviderRegistered "Microsoft.App"
+  Ensure-ProviderRegistered "Microsoft.ContainerRegistry"
+
+  # -------------------------
+  # ACR in same RG
+  # -------------------------
+  $subId = & az account show --query id -o tsv --only-show-errors 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $subId) { Fail "Failed to read subscription id from Azure CLI." }
+  $subId = $subId.Trim()
+
+  $bytes  = [System.Text.Encoding]::UTF8.GetBytes("$subId|$rg")
+  $sha    = [System.Security.Cryptography.SHA256]::Create()
+  $hash   = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
+  $acrName = ("acrhrmcp" + $hash.Substring(0,18)).ToLower()
+
+  Write-Host "ACR Name: $acrName" -ForegroundColor Cyan
+
+  $acrExists = & az acr show -g $rg -n $acrName --query name -o tsv 2>$null
+  if (-not $acrExists) {
+    Write-Host "Creating ACR..." -ForegroundColor Yellow
+    & az acr create -g $rg -n $acrName -l $rgLocation --sku Basic --admin-enabled true --only-show-errors | Out-Null
+  } else {
+    & az acr update -g $rg -n $acrName --admin-enabled true --only-show-errors | Out-Null
   }
-  if (-not (Test-Path $desktop)) {
-    Fail "Could not resolve a Desktop path for this user profile."
+
+  # -------------------------
+  # Ensure Dockerfile present (download from GitHub)
+  # -------------------------
+  if (-not (Test-Path $McpSourcePath)) {
+    Fail "MCP source path not found: $McpSourcePath"
   }
-  return $desktop
-}
 
-# -------------------------
-# Start
-# -------------------------
-Require-AzCli
-Ensure-LoggedIn
+  $dockerfileUrl   = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/MCPContainer/Dockerfile"
+  $dockerignoreUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/MCPContainer/.dockerignore"
 
-$rg = Resolve-ResourceGroup $ResourceGroupName
-Write-Host "Using Resource Group: $rg" -ForegroundColor Cyan
+  $dockerfilePath   = Join-Path $McpSourcePath "Dockerfile"
+  $dockerignorePath = Join-Path $McpSourcePath ".dockerignore"
 
-$rgLocation = (& az group show -n $rg --query location -o tsv --only-show-errors).Trim()
-Write-Host "RG Location: $rgLocation" -ForegroundColor Cyan
+  Write-Host "Downloading Dockerfile + .dockerignore..." -ForegroundColor Yellow
+  Invoke-WebRequest -Uri $dockerfileUrl -OutFile $dockerfilePath
+  Invoke-WebRequest -Uri $dockerignoreUrl -OutFile $dockerignorePath
 
-# Providers needed for MCP-only template + ACR
-# NOTE: Provider registration often requires subscription-level permissions.
-# If your lab subscription is already pre-registered, you can remove these calls.
-Ensure-ProviderRegistered "Microsoft.App"
-Ensure-ProviderRegistered "Microsoft.ContainerRegistry"
+  if ((Get-Item $dockerfilePath).Length -lt 50) {
+    Fail "Dockerfile download looks wrong/empty: $dockerfilePath"
+  }
 
-# -------------------------
-# ACR in same RG
-# -------------------------
-$subId = (& az account show --query id -o tsv --only-show-errors).Trim()
+  # Confirm build context has a csproj
+  $csproj = Get-ChildItem -Path $McpSourcePath -Filter *.csproj -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $csproj) {
+    Fail "No *.csproj found in $McpSourcePath. The Docker build context must include the app source, not just the Dockerfile."
+  }
 
-$bytes  = [System.Text.Encoding]::UTF8.GetBytes("$subId|$rg")
-$sha    = [System.Security.Cryptography.SHA256]::Create()
-$hash   = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
-$acrName = ("acrhrmcp" + $hash.Substring(0,18)).ToLower()
+  # -------------------------
+  # Build image in ACR (no Docker needed)
+  # -------------------------
+  $repo = "hr-mcp-server"
+  $qTags = "[?@=='$ImageTag'] | length(@)"
+  $tagCount = & az acr repository show-tags -n $acrName --repository $repo --query $qTags -o tsv 2>$null
 
-Write-Host "ACR Name: $acrName" -ForegroundColor Cyan
+  if ($tagCount -ne "1") {
+    Write-Host "Building container image in ACR..." -ForegroundColor Yellow
+    Push-Location $McpSourcePath
+    & az acr build -r $acrName -t "${repo}:${ImageTag}" . --only-show-errors
+    Pop-Location
+  } else {
+    Write-Host "Image already exists: ${repo}:${ImageTag} (skipping build)" -ForegroundColor Green
+  }
 
-$acrExists = & az acr show -g $rg -n $acrName --query name -o tsv 2>$null
-if (-not $acrExists) {
-  Write-Host "Creating ACR..." -ForegroundColor Yellow
-  & az acr create -g $rg -n $acrName -l $rgLocation --sku Basic --admin-enabled true --only-show-errors | Out-Null
-} else {
-  # Ensure admin creds are enabled because the Bicep uses listCredentials() to configure Container Apps registry auth
-  & az acr update -g $rg -n $acrName --admin-enabled true --only-show-errors | Out-Null
-}
+  # -------------------------
+  # Deploy Bicep
+  # -------------------------
+  $bicepUrl  = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/AzureTemplates/LAB565.bicep"
+  $bicepPath = Join-Path $env:TEMP "LAB565.bicep"
 
-# -------------------------
-# Ensure Dockerfile present (download from GitHub)
-# -------------------------
-if (-not (Test-Path $McpSourcePath)) {
-  Fail "MCP source path not found: $McpSourcePath"
-}
+  Write-Host "Downloading Bicep..." -ForegroundColor Yellow
+  Invoke-WebRequest -Uri $bicepUrl -OutFile $bicepPath
 
-$dockerfileUrl   = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/MCPContainer/Dockerfile"
-$dockerignoreUrl = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/MCPContainer/.dockerignore"
+  Write-Host "Validating Bicep..." -ForegroundColor Yellow
+  & az bicep build --file $bicepPath | Out-Null
 
-$dockerfilePath   = Join-Path $McpSourcePath "Dockerfile"
-$dockerignorePath = Join-Path $McpSourcePath ".dockerignore"
+  $mcpKey = [guid]::NewGuid().ToString("N")
+  $deploymentName = "deployment"
 
-Write-Host "Downloading Dockerfile + .dockerignore..." -ForegroundColor Yellow
-Invoke-WebRequest -Uri $dockerfileUrl -OutFile $dockerfilePath
-Invoke-WebRequest -Uri $dockerignoreUrl -OutFile $dockerignorePath
+  Write-Host "Deploying resources..." -ForegroundColor Yellow
+  & az deployment group create `
+    --name $deploymentName `
+    --resource-group $rg `
+    --template-file $bicepPath `
+    --parameters `
+        location="$rgLocation" `
+        acrResourceGroup="$rg" `
+        acrName="$acrName" `
+        mcpImageTag="$ImageTag" `
+        mcpApiKey="$mcpKey" `
+    --only-show-errors | Out-Null
 
-if ((Get-Item $dockerfilePath).Length -lt 50) {
-  Fail "Dockerfile download looks wrong/empty: $dockerfilePath"
-}
+  # -------------------------
+  # Outputs
+  # -------------------------
+  $mcpBaseUrl = & az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpBaseUrl.value" -o tsv --only-show-errors 2>$null
+  $mcpHeader  = & az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpHeaderName.value" -o tsv --only-show-errors 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $mcpBaseUrl -or -not $mcpHeader) { Fail "Failed to read deployment outputs." }
 
-# Make sure build context has a csproj (otherwise ACR build will fail later)
-$csproj = Get-ChildItem -Path $McpSourcePath -Filter *.csproj -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $csproj) {
-  Fail "No *.csproj found in $McpSourcePath. The Docker build context must include the app source, not just the Dockerfile."
-}
+  $mcpBaseUrl = $mcpBaseUrl.Trim()
+  $mcpHeader  = $mcpHeader.Trim()
 
-# -------------------------
-# Build image in ACR (no Docker needed)
-# -------------------------
-$repo = "hr-mcp-server"
-
-$qTags = "[?@=='$ImageTag'] | length(@)"
-$tagCount = & az acr repository show-tags -n $acrName --repository $repo --query $qTags -o tsv 2>$null
-
-if ($tagCount -ne "1") {
-  Write-Host "Building container image in ACR (this can take a few minutes)..." -ForegroundColor Yellow
-  Push-Location $McpSourcePath
-  & az acr build -r $acrName -t "${repo}:${ImageTag}" . --only-show-errors
-  Pop-Location
-} else {
-  Write-Host "Image already exists: ${repo}:${ImageTag} (skipping build)" -ForegroundColor Green
-}
-
-# -------------------------
-# Deploy Bicep (MCP-only template)
-# -------------------------
-$bicepUrl  = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/AzureTemplates/LAB565.bicep"
-$bicepPath = Join-Path $env:TEMP "LAB565.bicep"
-
-Write-Host "Downloading Bicep..." -ForegroundColor Yellow
-Invoke-WebRequest -Uri $bicepUrl -OutFile $bicepPath
-
-Write-Host "Validating Bicep..." -ForegroundColor Yellow
-& az bicep build --file $bicepPath | Out-Null
-
-$mcpKey = [guid]::NewGuid().ToString("N")
-$deploymentName = "deployment"
-
-Write-Host "Deploying resources..." -ForegroundColor Yellow
-& az deployment group create `
-  --name $deploymentName `
-  --resource-group $rg `
-  --template-file $bicepPath `
-  --parameters `
-      location="$rgLocation" `
-      acrResourceGroup="$rg" `
-      acrName="$acrName" `
-      mcpImageTag="$ImageTag" `
-      mcpApiKey="$mcpKey" `
-  --only-show-errors
-
-# -------------------------
-# Output student copy/paste values
-# -------------------------
-$mcpBaseUrl = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpBaseUrl.value" -o tsv --only-show-errors).Trim()
-$mcpHeader  = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpHeaderName.value" -o tsv --only-show-errors).Trim()
-
-""
-"==== STUDENT COPY/PASTE ===="
-"MCP Base URL : $mcpBaseUrl"
-"Header Name : $mcpHeader"
-"API Key     : $mcpKey"
-"==========================="
-""
-
-# -------------------------
-# Write student copy/paste to a Desktop file (MCP_Info.txt)
-# -------------------------
-$desktop = Get-DesktopPath
-$outFile = Join-Path $desktop "MCP_Info.txt"
-
-$content = @(
+  ""
   "==== STUDENT COPY/PASTE ===="
   "MCP Base URL : $mcpBaseUrl"
   "Header Name : $mcpHeader"
   "API Key     : $mcpKey"
   "==========================="
-)
+  ""
 
-Set-Content -Path $outFile -Value $content -Encoding UTF8 -Force
+  # Write to Desktop
+  $desktop = Get-DesktopPath
+  $outFile = Join-Path $desktop "MCP_Info.txt"
 
-Write-Host "Wrote MCP info file to: $outFile" -ForegroundColor Green
+  $content = @(
+    "==== STUDENT COPY/PASTE ===="
+    "MCP Base URL : $mcpBaseUrl"
+    "Header Name : $mcpHeader"
+    "API Key     : $mcpKey"
+    "==========================="
+  )
+  Set-Content -Path $outFile -Value $content -Encoding UTF8 -Force
+
+  Write-Host "Wrote MCP info file to: $outFile" -ForegroundColor Green
+  Write-Host "Log file: $logPath" -ForegroundColor Cyan
+}
+catch {
+  Write-Host ""
+  Write-Host "Deployment failed: $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host "Log file: $logPath" -ForegroundColor Yellow
+  Write-Host "If you launched this by right-clicking, use the CMD wrapper so the window stays open." -ForegroundColor Yellow
+  throw
+}
+finally {
+  try { Stop-Transcript | Out-Null } catch {}
+}
