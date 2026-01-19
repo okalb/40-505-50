@@ -1,14 +1,14 @@
 <# 
 Deploy-LAB565.ps1 (student-run)
-- Interactive az login
+- Interactive az login (only if not already logged in)
 - Choose/find target RG
-- Ensure ACR exists (in same RG)
+- Ensure ACR exists (in same RG) + admin enabled (needed for Bicep listCredentials pattern)
 - Download Dockerfile/.dockerignore into C:\labs\hr-mcp-server
 - ACR cloud build (no Docker required)
 - Download + validate Bicep
-- Deploy Bicep
+- Deploy Bicep (MCP-only version)
 - Print MCP URL + header + API key
-- Quick smoke test (expects 401/403 without key, then tries with key)
+- Write copy/paste values to Desktop file (MCP_Info.txt)
 #>
 
 [CmdletBinding()]
@@ -19,9 +19,6 @@ param(
 
   # Optional: specify RG explicitly to avoid ambiguity
   [string]$ResourceGroupName = "",
-
-  # Optional: if Entra lookup is blocked, instructor can provide this
-  [string]$LabUserObjectId = "",
 
   [string]$McpSourcePath = "C:\labs\hr-mcp-server",
   [string]$ImageTag = "v1"
@@ -89,27 +86,15 @@ function Ensure-ProviderRegistered($ns) {
   Fail "Provider $ns did not reach Registered state in time."
 }
 
-function Resolve-UserObjectId {
-  param([string]$Override)
-
-  if ($Override) { return $Override.Trim() }
-
-  # Attempt 1: signed-in-user (best)
-  try {
-    $id = (& az ad signed-in-user show --query id -o tsv 2>$null).Trim()
-    if ($id) { return $id }
-  } catch {}
-
-  # Attempt 2: account UPN -> user show
-  try {
-    $upn = (& az account show --query user.name -o tsv 2>$null).Trim()
-    if ($upn) {
-      $id = (& az ad user show --id $upn --query id -o tsv 2>$null).Trim()
-      if ($id) { return $id }
-    }
-  } catch {}
-
-  return ""
+function Get-DesktopPath {
+  $desktop = [Environment]::GetFolderPath('Desktop')
+  if (-not $desktop -or -not (Test-Path $desktop)) {
+    $desktop = Join-Path $env:USERPROFILE "Desktop"
+  }
+  if (-not (Test-Path $desktop)) {
+    Fail "Could not resolve a Desktop path for this user profile."
+  }
+  return $desktop
 }
 
 # -------------------------
@@ -124,13 +109,11 @@ Write-Host "Using Resource Group: $rg" -ForegroundColor Cyan
 $rgLocation = (& az group show -n $rg --query location -o tsv --only-show-errors).Trim()
 Write-Host "RG Location: $rgLocation" -ForegroundColor Cyan
 
-# Providers needed by your template + container apps
+# Providers needed for MCP-only template + ACR
+# NOTE: Provider registration often requires subscription-level permissions.
+# If your lab subscription is already pre-registered, you can remove these calls.
 Ensure-ProviderRegistered "Microsoft.App"
 Ensure-ProviderRegistered "Microsoft.ContainerRegistry"
-Ensure-ProviderRegistered "Microsoft.Storage"
-Ensure-ProviderRegistered "Microsoft.Search"
-Ensure-ProviderRegistered "Microsoft.CognitiveServices"
-Ensure-ProviderRegistered "Microsoft.Authorization"
 
 # -------------------------
 # ACR in same RG
@@ -149,6 +132,7 @@ if (-not $acrExists) {
   Write-Host "Creating ACR..." -ForegroundColor Yellow
   & az acr create -g $rg -n $acrName -l $rgLocation --sku Basic --admin-enabled true --only-show-errors | Out-Null
 } else {
+  # Ensure admin creds are enabled because the Bicep uses listCredentials() to configure Container Apps registry auth
   & az acr update -g $rg -n $acrName --admin-enabled true --only-show-errors | Out-Null
 }
 
@@ -184,7 +168,6 @@ if (-not $csproj) {
 # -------------------------
 $repo = "hr-mcp-server"
 
-# PowerShell-safe JMESPath
 $qTags = "[?@=='$ImageTag'] | length(@)"
 $tagCount = & az acr repository show-tags -n $acrName --repository $repo --query $qTags -o tsv 2>$null
 
@@ -198,7 +181,7 @@ if ($tagCount -ne "1") {
 }
 
 # -------------------------
-# Deploy Bicep
+# Deploy Bicep (MCP-only template)
 # -------------------------
 $bicepUrl  = "https://raw.githubusercontent.com/$RepoOwner/$RepoName/$Branch/AzureTemplates/LAB565.bicep"
 $bicepPath = Join-Path $env:TEMP "LAB565.bicep"
@@ -206,22 +189,8 @@ $bicepPath = Join-Path $env:TEMP "LAB565.bicep"
 Write-Host "Downloading Bicep..." -ForegroundColor Yellow
 Invoke-WebRequest -Uri $bicepUrl -OutFile $bicepPath
 
-# Validate Bicep syntax early (catches copy/formatting issues)
 Write-Host "Validating Bicep..." -ForegroundColor Yellow
 & az bicep build --file $bicepPath | Out-Null
-
-$userObjectId = Resolve-UserObjectId $LabUserObjectId
-if (-not $userObjectId) {
-  Write-Host ""
-  Write-Host "ERROR: Couldn't determine your Entra user Object ID." -ForegroundColor Red
-  Write-Host "This is required because the Bicep assigns roles to the lab user." -ForegroundColor Yellow
-  Write-Host ""
-  Write-Host "Fix options:" -ForegroundColor Cyan
-  Write-Host "  1) Re-run the script with: -LabUserObjectId <GUID>" -ForegroundColor Cyan
-  Write-Host "  2) Or remove the 'LAB USER ROLE ASSIGNMENTS' section from the Bicep if not needed." -ForegroundColor Cyan
-  Write-Host ""
-  Fail "Missing labUserObjectId"
-}
 
 $mcpKey = [guid]::NewGuid().ToString("N")
 $deploymentName = "deployment"
@@ -232,7 +201,6 @@ Write-Host "Deploying resources..." -ForegroundColor Yellow
   --resource-group $rg `
   --template-file $bicepPath `
   --parameters `
-      labUserObjectId="$userObjectId" `
       location="$rgLocation" `
       acrResourceGroup="$rg" `
       acrName="$acrName" `
@@ -243,8 +211,8 @@ Write-Host "Deploying resources..." -ForegroundColor Yellow
 # -------------------------
 # Output student copy/paste values
 # -------------------------
-$mcpBaseUrl = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpBaseUrl.value" -o tsv).Trim()
-$mcpHeader  = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpHeaderName.value" -o tsv).Trim()
+$mcpBaseUrl = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpBaseUrl.value" -o tsv --only-show-errors).Trim()
+$mcpHeader  = (& az deployment group show -g $rg -n $deploymentName --query "properties.outputs.mcpHeaderName.value" -o tsv --only-show-errors).Trim()
 
 ""
 "==== STUDENT COPY/PASTE ===="
@@ -255,34 +223,19 @@ $mcpHeader  = (& az deployment group show -g $rg -n $deploymentName --query "pro
 ""
 
 # -------------------------
-# Quick smoke test
+# Write student copy/paste to a Desktop file (MCP_Info.txt)
 # -------------------------
-Write-Host "Testing MCP URL (no header)..." -ForegroundColor Yellow
-try {
-  $r = Invoke-WebRequest -Uri $mcpBaseUrl -UseBasicParsing -TimeoutSec 25
-  Write-Host "MCP responded (HTTP $($r.StatusCode))." -ForegroundColor Green
-} catch {
-  $code = $null
-  if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-  if ($code -in 401,403) {
-    Write-Host "MCP is reachable and enforcing auth (HTTP $code) ✅" -ForegroundColor Green
-  } else {
-    Write-Host "MCP call failed (possible warmup/ingress/port issue)." -ForegroundColor Yellow
-    if ($code) { Write-Host "HTTP $code" -ForegroundColor Yellow }
-    else { Write-Host $_.Exception.Message -ForegroundColor Yellow }
-    Write-Host "If you see 502/503, check Container App revision/logs (often port mismatch or app crash)." -ForegroundColor Yellow
-  }
-}
+$desktop = Get-DesktopPath
+$outFile = Join-Path $desktop "MCP_Info.txt"
 
-if ($mcpHeader -and $mcpKey) {
-  Write-Host "Testing MCP URL (with header)..." -ForegroundColor Yellow
-  try {
-    $headers = @{ $mcpHeader = $mcpKey }
-    $r2 = Invoke-WebRequest -Uri $mcpBaseUrl -Headers $headers -UseBasicParsing -TimeoutSec 25
-    Write-Host "MCP responded with header (HTTP $($r2.StatusCode)). ✅" -ForegroundColor Green
-  } catch {
-    $code2 = $null
-    if ($_.Exception.Response) { $code2 = [int]$_.Exception.Response.StatusCode }
-    Write-Host "Header test returned HTTP $code2 (this may be OK depending on your app routes)." -ForegroundColor Yellow
-  }
-}
+$content = @(
+  "==== STUDENT COPY/PASTE ===="
+  "MCP Base URL : $mcpBaseUrl"
+  "Header Name : $mcpHeader"
+  "API Key     : $mcpKey"
+  "==========================="
+)
+
+Set-Content -Path $outFile -Value $content -Encoding UTF8 -Force
+
+Write-Host "Wrote MCP info file to: $outFile" -ForegroundColor Green
